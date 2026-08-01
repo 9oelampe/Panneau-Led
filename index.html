@@ -330,22 +330,77 @@ function pathDot(c,shape,x,y,r){
 
 /* ============ tuile de texte (mise en cache) ============ */
 const tileCache = new Map();
-function tileKey(px,st){return [st.text,st.upper,st.font,st.weight,st.effect,st.fg,Math.round(px)].join("|");}
+const fitCache  = new Map();
+function tileKey(px,st,wrapW){return [st.text,st.upper,st.font,st.weight,st.effect,st.fg,Math.round(px),wrapW?Math.round(wrapW):0].join("|");}
 
-function buildTile(px,st){
-  const key = tileKey(px,st);
+/* Découpe le message en lignes tenant dans wrapW. wrapW nul = une seule ligne. */
+function wrapText(wOf, txt, wrapW){
+  if(!wrapW || wOf(txt) <= wrapW) return [txt];
+  const words = txt.split(/\s+/).filter(Boolean);
+  if(words.length < 2) return [txt];
+  const lines = []; let cur = words[0];
+  for(let i=1;i<words.length;i++){
+    const test = cur + " " + words[i];
+    if(wOf(test) <= wrapW) cur = test;
+    else { lines.push(cur); cur = words[i]; }
+  }
+  lines.push(cur);
+  return lines;
+}
+
+/* Plus grande police à laquelle le message entier tient dans la boîte,
+   réparti sur autant de lignes que nécessaire. Recherche par dichotomie,
+   sur simple mesure : aucun rendu, donc mise en cache et coût négligeable. */
+function fitPx(st, boxW, boxH){
+  const key = [st.text,st.upper,st.font,st.weight,Math.round(boxW),Math.round(boxH)].join("|");
+  if(fitCache.has(key)) return fitCache.get(key);
+
+  const txt = (st.upper ? String(st.text).toUpperCase() : String(st.text)) || " ";
+  const fam = (FONTS[st.font]||FONTS[0])[1];
+  const probe = document.createElement("canvas").getContext("2d");
+
+  const fits = px => {
+    probe.font = `${st.weight} ${px}px ${fam}`;
+    const wOf = s => probe.measureText(s).width;
+    const pad = px*0.30, wrapW = boxW - pad*2;
+    if(wrapW <= px*0.4) return false;
+    const lines = wrapText(wOf, txt, wrapW);
+    if(Math.max(...lines.map(wOf)) > wrapW) return false;   // un mot seul trop long
+    const m = probe.measureText(txt);
+    const asc  = m.actualBoundingBoxAscent  || px*0.80;
+    const desc = m.actualBoundingBoxDescent || px*0.26;
+    return (asc+desc)*1.16*(lines.length-1) + asc + desc + pad*2 <= boxH;
+  };
+
+  let lo = 6, hi = Math.max(10, boxH*1.3);
+  if(fits(hi)) lo = hi;
+  else for(let i=0;i<20;i++){ const mid=(lo+hi)/2; if(fits(mid)) lo = mid; else hi = mid; }
+
+  if(fitCache.size > 24) fitCache.clear();
+  fitCache.set(key, lo);
+  return lo;
+}
+
+function buildTile(px,st,wrapW){
+  const key = tileKey(px,st,wrapW);
   if(tileCache.has(key)) return tileCache.get(key);
 
   const txt = (st.upper ? String(st.text).toUpperCase() : String(st.text)) || " ";
   const fam = (FONTS[st.font]||FONTS[0])[1];
   const probe = document.createElement("canvas").getContext("2d");
   probe.font = `${st.weight} ${px}px ${fam}`;
+  const wOf = s => probe.measureText(s).width;
+
+  const lines = wrapText(wOf, txt, wrapW);
   const m = probe.measureText(txt);
-  const asc  = m.actualBoundingBoxAscent  || px*0.80;
-  const desc = m.actualBoundingBoxDescent || px*0.26;
-  const pad  = px*0.30;
-  const w = Math.max(2, Math.ceil(m.width + pad*2));
-  const h = Math.max(2, Math.ceil(asc + desc + pad*2));
+  const asc   = m.actualBoundingBoxAscent  || px*0.80;
+  const desc  = m.actualBoundingBoxDescent || px*0.26;
+  const lineH = (asc + desc) * 1.16;
+  const pad   = px*0.30;
+  const textW  = Math.max(1, ...lines.map(wOf));
+  const blockH = lineH*(lines.length-1) + asc + desc;
+  const w = Math.max(2, Math.ceil(textW + pad*2));
+  const h = Math.max(2, Math.ceil(blockH + pad*2));
 
   const cv = document.createElement("canvas");
   cv.width = w; cv.height = h;
@@ -353,10 +408,13 @@ function buildTile(px,st){
   c.font = `${st.weight} ${px}px ${fam}`;
   c.textBaseline = "alphabetic";
   const X = pad, Y = pad + asc;
-  const top = pad, bot = pad + asc + desc;
+  const top = pad, bot = pad + blockH;
+
+  const fillAll   = (dx,dy)=> lines.forEach((ln,i)=> c.fillText(ln,   X + (textW - wOf(ln))/2 + (dx||0), Y + i*lineH + (dy||0)));
+  const strokeAll = ()=>      lines.forEach((ln,i)=> c.strokeText(ln, X + (textW - wOf(ln))/2,           Y + i*lineH));
 
   const grad = (stops,horiz) => {
-    const g = horiz ? c.createLinearGradient(X,0,X+m.width,0) : c.createLinearGradient(0,top,0,bot);
+    const g = horiz ? c.createLinearGradient(X,0,X+textW,0) : c.createLinearGradient(0,top,0,bot);
     stops.forEach((s,i)=>g.addColorStop(i/(stops.length-1),s));
     return g;
   };
@@ -364,35 +422,35 @@ function buildTile(px,st){
   switch(st.effect){
     case "neon":
       c.shadowColor = st.fg;
-      [px*0.42,px*0.24,px*0.11].forEach(b=>{ c.shadowBlur=b; c.fillStyle=st.fg; c.fillText(txt,X,Y); });
+      [px*0.42,px*0.24,px*0.11].forEach(b=>{ c.shadowBlur=b; c.fillStyle=st.fg; fillAll(); });
       c.shadowBlur = px*0.06;
       c.fillStyle = mix(st.fg,"#ffffff",0.62);
-      c.fillText(txt,X,Y);
+      fillAll();
       break;
     case "contour":
       c.lineWidth = Math.max(1.5, px*0.055);
       c.lineJoin = "round"; c.strokeStyle = st.fg;
-      c.strokeText(txt,X,Y);
+      strokeAll();
       break;
     case "ombre":
       c.fillStyle = mix(st.fg,"#000000",0.62);
-      c.fillText(txt, X + px*0.055, Y + px*0.055);
-      c.fillStyle = st.fg; c.fillText(txt,X,Y);
+      fillAll(px*0.055, px*0.055);
+      c.fillStyle = st.fg; fillAll();
       break;
     case "degrade":
       c.fillStyle = grad([mix(st.fg,"#ffffff",0.55), st.fg, mix(st.fg,"#000000",0.42)],false);
-      c.fillText(txt,X,Y); break;
+      fillAll(); break;
     case "arc":
       c.fillStyle = grad(["#FF2D55","#FF9500","#FFE600","#35FF6B","#31C7FF","#5E5CE6","#FF2D55"],true);
-      c.fillText(txt,X,Y); break;
+      fillAll(); break;
     case "chrome":
       c.fillStyle = grad(["#ffffff","#dfe7f0","#8d99ab","#f4f8fc","#59616f","#c6d1dd"],false);
-      c.fillText(txt,X,Y); break;
+      fillAll(); break;
     case "feu":
       c.fillStyle = grad(["#fff9d6","#ffd227","#ff8a00","#e02200"],false);
-      c.fillText(txt,X,Y); break;
+      fillAll(); break;
     default:
-      c.fillStyle = st.fg; c.fillText(txt,X,Y);
+      c.fillStyle = st.fg; fillAll();
   }
 
   if(tileCache.size > 18) tileCache.clear();
@@ -412,13 +470,18 @@ function alphaAt(t,st){
 
 /* ============ composition du défilement ============ */
 function paintScroll(c,W,H,t,px,st){
-  const tile = buildTile(px,st);
-  const y = (H - tile.height)/2;
   if(st.dir==="fixe"){
-    const k = Math.min(1, (W*0.97)/tile.width);
+    // On part de la plus grande police qui tienne, puis le curseur Taille
+    // agit comme un taux de remplissage de l'écran (30 % → 100 %).
+    const boxW = W*0.94, boxH = H*0.94;
+    const p = Math.max(8, fitPx(st,boxW,boxH) * (st.size/95));
+    const tile = buildTile(p, st, boxW - p*0.6);
+    const k = Math.min(1, boxW/tile.width, boxH/tile.height);
     c.drawImage(tile, (W-tile.width*k)/2, (H-tile.height*k)/2, tile.width*k, tile.height*k);
     return;
   }
+  const tile = buildTile(px,st,0);
+  const y = (H - tile.height)/2;
   const gap = H*0.55;
   const span = tile.width + gap;
   const v = st.speed * W * 0.055;
@@ -637,11 +700,13 @@ $("#cell").addEventListener("input", e=>{ S.cell = +e.target.value; sync(); });
 $("#speed").addEventListener("input", e=>{ S.speed = +e.target.value; sync(); });
 
 function sync(){
-  tileCache.clear();
+  tileCache.clear(); fitCache.clear();
   if($("#msg").value !== S.text) $("#msg").value = S.text;
-  $("#size").value = S.size;
-  $("#cell").value = S.cell;
-  $("#speed").value = S.speed;
+  // ne jamais réécrire un curseur pendant qu'un doigt le tient : iOS interrompt le glissé
+  const setRange = (sel,v)=>{ const el=$(sel); if(+el.value !== v) el.value = v; };
+  setRange("#size",  S.size);
+  setRange("#cell",  S.cell);
+  setRange("#speed", S.speed);
   $("#caseBtn").setAttribute("aria-pressed", S.upper ? "true":"false");
   $("#caseBtn").textContent = S.upper ? "AA" : "aa";
   ["#fonts","#weights","#effects","#blinks","#leds","#grid","#dirs","#rotates"].forEach(s=>paintChips($(s)));
