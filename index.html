@@ -267,7 +267,7 @@ const FONTS = [
   ["Anglaise",'"Snell Roundhand","Savoye LET","Apple Chancery",cursive'],
   ["Copperplate",'Copperplate,"Copperplate Gothic Light",Papyrus,fantasy']
 ];
-const WEIGHTS = [["Normal",400],["Gras",700],["Noir",900]];
+const WEIGHTS = [[400,"Normal"],[700,"Gras"],[900,"Noir"]];
 const EFFECTS = [["plein","Plein"],["neon","Néon"],["contour","Contour"],["ombre","Ombre dure"],
                  ["degrade","Dégradé"],["arc","Arc-en-ciel"],["chrome","Chrome"],["feu","Feu"]];
 const BLINKS  = [["off","Aucun"],["clignote","Clignote"],["pulse","Pulsation"],["strobe","Strobo"]];
@@ -335,6 +335,15 @@ const stripCache = new Map();
 const fitCache   = new Map();
 let tilePixels = 0;
 function clearTiles(){ tileCache.clear(); stripCache.clear(); fitCache.clear(); tilePixels = 0; }
+
+/* Une graisse ou une police invalide produirait une chaîne CSS rejetée par
+   le canvas, qui garderait alors sa police par défaut de 10 px : texte
+   minuscule et impossible à rattraper. On assainit donc à la source. */
+function fontOf(st,px){
+  const wt  = WEIGHTS.some(w=>w[0]===st.weight) ? st.weight : 700;
+  const fam = (FONTS[st.font]||FONTS[0])[1];
+  return `${wt} ${Math.max(1,px)}px ${fam}`;
+}
 function tileKey(px,st,wrapW,txt){return [txt!=null?txt:st.text,st.upper,st.font,st.weight,st.effect,st.fg,Math.round(px),wrapW?Math.round(wrapW):0].join("|");}
 
 /* Découpe le message en lignes tenant dans wrapW. wrapW nul = une seule ligne. */
@@ -360,11 +369,10 @@ function fitPx(st, boxW, boxH){
   if(fitCache.has(key)) return fitCache.get(key);
 
   const txt = (st.upper ? String(st.text).toUpperCase() : String(st.text)) || " ";
-  const fam = (FONTS[st.font]||FONTS[0])[1];
   const probe = document.createElement("canvas").getContext("2d");
 
   const fits = px => {
-    probe.font = `${st.weight} ${px}px ${fam}`;
+    probe.font = fontOf(st,px);
     const wOf = s => probe.measureText(s).width;
     const pad = px*0.30, wrapW = boxW - pad*2;
     if(wrapW <= px*0.4) return false;
@@ -391,9 +399,8 @@ function buildTile(px,st,wrapW,textOverride){
 
   const base = textOverride != null ? textOverride : String(st.text);
   const txt = (st.upper ? base.toUpperCase() : base) || " ";
-  const fam = (FONTS[st.font]||FONTS[0])[1];
   const probe = document.createElement("canvas").getContext("2d");
-  probe.font = `${st.weight} ${px}px ${fam}`;
+  probe.font = fontOf(st,px);
   const wOf = s => probe.measureText(s).width;
 
   const lines = wrapText(wOf, txt, wrapW);
@@ -410,7 +417,7 @@ function buildTile(px,st,wrapW,textOverride){
   const cv = document.createElement("canvas");
   cv.width = w; cv.height = h;
   const c = cv.getContext("2d");
-  c.font = `${st.weight} ${px}px ${fam}`;
+  c.font = fontOf(st,px);
   c.textBaseline = "alphabetic";
   const X = pad, Y = pad + asc;
   const top = pad, bot = pad + blockH;
@@ -472,9 +479,8 @@ function buildStrip(px,st){
   if(stripCache.has(key)) return stripCache.get(key);
 
   const txt = (st.upper ? String(st.text).toUpperCase() : String(st.text)) || " ";
-  const fam = (FONTS[st.font]||FONTS[0])[1];
   const probe = document.createElement("canvas").getContext("2d");
-  probe.font = `${st.weight} ${px}px ${fam}`;
+  probe.font = fontOf(st,px);
   const wOf = s => probe.measureText(s).width;
   const pad = px*0.30;
   const budget = Math.max(px*2, MAX_TILE - pad*2);
