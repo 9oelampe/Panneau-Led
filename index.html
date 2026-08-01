@@ -329,9 +329,13 @@ function pathDot(c,shape,x,y,r){
 }
 
 /* ============ tuile de texte (mise en cache) ============ */
-const tileCache = new Map();
-const fitCache  = new Map();
-function tileKey(px,st,wrapW){return [st.text,st.upper,st.font,st.weight,st.effect,st.fg,Math.round(px),wrapW?Math.round(wrapW):0].join("|");}
+const MAX_TILE   = 3800;          // marge sous la limite de 4096 px par côté d'iOS Safari
+const tileCache  = new Map();
+const stripCache = new Map();
+const fitCache   = new Map();
+let tilePixels = 0;
+function clearTiles(){ tileCache.clear(); stripCache.clear(); fitCache.clear(); tilePixels = 0; }
+function tileKey(px,st,wrapW,txt){return [txt!=null?txt:st.text,st.upper,st.font,st.weight,st.effect,st.fg,Math.round(px),wrapW?Math.round(wrapW):0].join("|");}
 
 /* Découpe le message en lignes tenant dans wrapW. wrapW nul = une seule ligne. */
 function wrapText(wOf, txt, wrapW){
@@ -381,11 +385,12 @@ function fitPx(st, boxW, boxH){
   return lo;
 }
 
-function buildTile(px,st,wrapW){
-  const key = tileKey(px,st,wrapW);
+function buildTile(px,st,wrapW,textOverride){
+  const key = tileKey(px,st,wrapW,textOverride);
   if(tileCache.has(key)) return tileCache.get(key);
 
-  const txt = (st.upper ? String(st.text).toUpperCase() : String(st.text)) || " ";
+  const base = textOverride != null ? textOverride : String(st.text);
+  const txt = (st.upper ? base.toUpperCase() : base) || " ";
   const fam = (FONTS[st.font]||FONTS[0])[1];
   const probe = document.createElement("canvas").getContext("2d");
   probe.font = `${st.weight} ${px}px ${fam}`;
@@ -399,8 +404,8 @@ function buildTile(px,st,wrapW){
   const pad   = px*0.30;
   const textW  = Math.max(1, ...lines.map(wOf));
   const blockH = lineH*(lines.length-1) + asc + desc;
-  const w = Math.max(2, Math.ceil(textW + pad*2));
-  const h = Math.max(2, Math.ceil(blockH + pad*2));
+  const w = Math.min(MAX_TILE, Math.max(2, Math.ceil(textW + pad*2)));
+  const h = Math.min(MAX_TILE, Math.max(2, Math.ceil(blockH + pad*2)));
 
   const cv = document.createElement("canvas");
   cv.width = w; cv.height = h;
@@ -453,9 +458,49 @@ function buildTile(px,st,wrapW){
       c.fillStyle = st.fg; fillAll();
   }
 
-  if(tileCache.size > 18) tileCache.clear();
+  if(tilePixels > 24e6) clearTiles();
+  tilePixels += w*h;
   tileCache.set(key,cv);
   return cv;
+}
+
+/* Un message long dépasse largement la largeur maximale d'un canvas iOS.
+   On le découpe donc en tronçons aux espaces, chacun sous la limite, que
+   l'on raboute à l'affichage : le ruban peut alors être infiniment long. */
+function buildStrip(px,st){
+  const key = tileKey(px,st,0,null);
+  if(stripCache.has(key)) return stripCache.get(key);
+
+  const txt = (st.upper ? String(st.text).toUpperCase() : String(st.text)) || " ";
+  const fam = (FONTS[st.font]||FONTS[0])[1];
+  const probe = document.createElement("canvas").getContext("2d");
+  probe.font = `${st.weight} ${px}px ${fam}`;
+  const wOf = s => probe.measureText(s).width;
+  const pad = px*0.30;
+  const budget = Math.max(px*2, MAX_TILE - pad*2);
+
+  let chunks = [txt];
+  if(wOf(txt) > budget){
+    chunks = [];
+    let cur = "";
+    for(const word of txt.split(" ")){
+      const test = cur === "" ? word : cur + " " + word;
+      if(cur === "" || wOf(test) <= budget) cur = test;
+      else { chunks.push(cur + " "); cur = word; }
+    }
+    if(cur !== "") chunks.push(cur);
+  }
+
+  const tiles = chunks.map(ch => buildTile(px, st, 0, ch));
+  const adv   = chunks.map(ch => wOf(ch));
+  const strip = {
+    tiles, adv,
+    width : adv.reduce((a,b)=>a+b,0) + pad*2,
+    height: tiles[0].height
+  };
+  if(stripCache.size > 8) stripCache.clear();
+  stripCache.set(key, strip);
+  return strip;
 }
 
 /* ============ modulation temporelle ============ */
@@ -480,15 +525,23 @@ function paintScroll(c,W,H,t,px,st){
     c.drawImage(tile, (W-tile.width*k)/2, (H-tile.height*k)/2, tile.width*k, tile.height*k);
     return;
   }
-  const tile = buildTile(px,st,0);
-  const y = (H - tile.height)/2;
+  const strip = buildStrip(px,st);
+  const y = (H - strip.height)/2;
   const gap = H*0.55;
-  const span = tile.width + gap;
+  const span = strip.width + gap;
   const v = st.speed * W * 0.055;
   let off = (t*v) % span;
   if(st.dir==="right") off = span - off;
-  let x = -off;
-  while(x < W){ c.drawImage(tile,x,y); x += span; }
+  let x = -off, guard = 0;
+  while(x < W && guard++ < 200){
+    let cx = x;
+    for(let i=0;i<strip.tiles.length;i++){
+      const tl = strip.tiles[i];
+      if(cx < W && cx + tl.width > 0) c.drawImage(tl, cx, y);
+      cx += strip.adv[i];
+    }
+    x += span;
+  }
 }
 
 /* ============ grille éteinte (statique, donc pré-calculée) ============ */
@@ -616,22 +669,29 @@ function fit(cv){
   return [w,h,d];
 }
 
+let frameFails = 0;
 function frame(ms){
   const t = ms/1000;
-  const [pw,ph,pd] = fit(preview);
-  pctx.setTransform(pd,0,0,pd,0,0);
-  render(pctx,pw,ph,t,S);
+  try{
+    const [pw,ph,pd] = fit(preview);
+    pctx.setTransform(pd,0,0,pd,0,0);
+    render(pctx,pw,ph,t,S);
 
-  if(showing){
-    const [sw,sh,sd] = fit(stage);
-    turned = (S.rotate==="force" && sh > sw);
-    sctx.setTransform(1,0,0,1,0,0);
-    sctx.clearRect(0,0,stage.width,stage.height);
-    sctx.save();
-    sctx.scale(sd,sd);
-    if(turned){ sctx.translate(sw,0); sctx.rotate(Math.PI/2); }
-    render(sctx, turned?sh:sw, turned?sw:sh, t, showState());
-    sctx.restore();
+    if(showing){
+      const [sw,sh,sd] = fit(stage);
+      turned = (S.rotate==="force" && sh > sw);
+      sctx.setTransform(1,0,0,1,0,0);
+      sctx.clearRect(0,0,stage.width,stage.height);
+      sctx.save();
+      sctx.scale(sd,sd);
+      if(turned){ sctx.translate(sw,0); sctx.rotate(Math.PI/2); }
+      render(sctx, turned?sh:sw, turned?sw:sh, t, showState());
+      sctx.restore();
+    }
+    frameFails = 0;
+  }catch(err){
+    // un canvas refusé par le système ne doit jamais figer le panneau
+    if(++frameFails === 1){ clearTiles(); console.warn("Image ignorée :", err); }
   }
   requestAnimationFrame(frame);
 }
@@ -700,7 +760,7 @@ $("#cell").addEventListener("input", e=>{ S.cell = +e.target.value; sync(); });
 $("#speed").addEventListener("input", e=>{ S.speed = +e.target.value; sync(); });
 
 function sync(){
-  tileCache.clear(); fitCache.clear();
+  clearTiles();
   if($("#msg").value !== S.text) $("#msg").value = S.text;
   // ne jamais réécrire un curseur pendant qu'un doigt le tient : iOS interrompt le glissé
   const setRange = (sel,v)=>{ const el=$(sel); if(+el.value !== v) el.value = v; };
